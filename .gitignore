@@ -9,6 +9,7 @@ node_modules
 .shot/
 .edge-shot/
 .edge-profile/
+.scratch/
 
 # 日志
 *.log
