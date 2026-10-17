@@ -64,6 +64,28 @@ async function bindAnyPort(server, candidates) {
   }
 }
 
+/** 实际监听的端口。Host 头校验要与它比对，因此必须在 listen 之后回填。 */
+let boundPort = 0
+
+/**
+ * 只接受指向本机、且端口与实际监听端口一致的 Host。
+ *
+ * 为什么必须校验：绑定 127.0.0.1 只约束「监听的地址」，并不约束「浏览器认为
+ * 自己在访问谁」。攻击者把自己的域名解析到 127.0.0.1（DNS rebinding），浏览器
+ * 仍按域名判定同源，于是那个页面就能读走这里的全部内容——包括 config.local.js
+ * 里的 API Key。校验 Host 让这类请求在到达文件读取之前就被拒绝。
+ */
+function isAllowedHost(hostHeader) {
+  if (!hostHeader) return false
+  // 形如 127.0.0.1:5178 / localhost:5178 / [::1]:5178；无端口或畸形一律不认
+  const m = /^(\[[0-9a-fA-F:]+\]|[^:]+)(?::(\d+))?$/.exec(hostHeader.trim())
+  if (!m) return false
+  const name = m[1].toLowerCase()
+  if (name !== '127.0.0.1' && name !== 'localhost' && name !== '[::1]') return false
+  // 端口必须与真实监听端口一致：缺省端口（80）不可能命中 517x 区间
+  return m[2] !== undefined && Number(m[2]) === boundPort
+}
+
 function safePath(urlPath) {
   const decoded = decodeURIComponent(urlPath.split('?')[0])
   const rel = normalize(decoded).replace(/^([/\\])+/, '')
@@ -100,6 +122,11 @@ async function main() {
 
   const server = createServer(async (req, res) => {
     try {
+      // Host 头校验先于一切文件操作：拦住 DNS rebinding 的同源伪装配
+      if (!isAllowedHost(req.headers.host)) {
+        res.writeHead(403).end('forbidden')
+        return
+      }
       const abs = safePath(req.url ?? '/')
       if (!abs) {
         res.writeHead(403).end('forbidden')
@@ -125,6 +152,7 @@ async function main() {
   })
 
   const port = await bindAnyPort(server, [5178, 5179, 5180, 5181])
+  boundPort = port
   const url = `http://127.0.0.1:${port}/`
 
   // 独立的用户数据目录，避免与日常 Edge 实例冲突导致 --app 被并入已有窗口
