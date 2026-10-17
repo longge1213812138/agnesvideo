@@ -1,0 +1,14 @@
+# 本地配置：含真实 API Key，绝不提交
+public/config.local.js
+
+# 构建与依赖
+dist
+node_modules
+
+# 验证与运行产物
+.shot/
+.edge-shot/
+.edge-profile/
+
+# 日志
+*.log
