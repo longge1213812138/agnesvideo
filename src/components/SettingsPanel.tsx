@@ -86,6 +86,10 @@ export function SettingsPanel({ open, onClose, onChanged }: Props) {
           Key 由你自己持有，仅存放在本机。该工具不采集、不上传任何数据；生成的视频由 Agnes 服务端托管，
           成片地址可能过期，过期后可用视频 ID 重新查询。
         </p>
+        <p className="muted small">
+          免费档视频模型只有 1 次/分钟的实际 RPM，且同类型 Key 共享同一个额度池——多开几个免费 Key
+          不会提高限额。遇到「服务端生成队列已满」时，换 Key 不一定有用，通常只能错开时间再试。
+        </p>
       </div>
     </div>
   )

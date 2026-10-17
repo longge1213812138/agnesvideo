@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { createVideo } from './api/agnes'
+import { createVideo, submitThrottle, type CreateWaitProgress } from './api/agnes'
 import type { AgnesError, HistoryEntry } from './api/types'
 import { DEFAULT_SECONDS } from './api/types'
+import { CreateWaitBanner } from './components/CreateWaitBanner'
 import { ErrorBanner } from './components/ErrorBanner'
 import { PromptForm, type PromptValues } from './components/PromptForm'
 import { SettingsPanel } from './components/SettingsPanel'
@@ -27,9 +28,9 @@ export default function App() {
   const [keyVersion, setKeyVersion] = useState(0)
 
   const pollerRef = useRef<Poller | null>(null)
-  const [retryNotice, setRetryNotice] = useState<{ attempt: number; total: number; message: string } | null>(
-    null,
-  )
+  const [waitProgress, setWaitProgress] = useState<CreateWaitProgress | null>(null)
+  const [throttleRemaining, setThrottleRemaining] = useState(0)
+  const abortRef = useRef<AbortController | null>(null)
 
   const pushError = useCallback((error: AgnesError) => {
     // 相同 title+raw 的错误只保留一条，避免轮询刷屏
@@ -92,31 +93,29 @@ export default function App() {
     }
 
     setSubmitting(true)
+    const controller = new AbortController()
+    abortRef.current = controller
     try {
       const result = await createVideo({
         prompt: input.prompt.trim(),
         seconds: input.seconds,
         aspectRatio: input.aspectRatio,
-        // 队列拥塞是 Agnes 侧的常态，自动重试两轮比让用户干等更实用
-        autoRetry: 2,
-        onRetry: ({ attempt, total, error }) => {
-          setRetryNotice({
-            attempt,
-            total,
-            message: `${error.title}，正在等待自动重试（${attempt}/${total}）`,
-          })
-        },
-        onRetryTick: (remaining) => {
-          setRetryNotice((prev) =>
-            prev
-              ? { ...prev, message: `${prev.message.split('，')[0]}，${remaining} 秒后自动重试（${prev.attempt}/${prev.total}）` }
-              : prev,
-          )
+        // 队列满可能持续数十分钟（见 docs/research/2026-10-17-video-queue-full.md），
+        // 给 15 分钟 / 6 次尝试的耐心窗口，并允许用户随时取消
+        plan: { maxAttempts: 6, totalBudgetMs: 15 * 60 * 1000 },
+        signal: controller.signal,
+        onWait: (progress) => {
+          setWaitProgress(progress)
+          setThrottleRemaining(Math.ceil(submitThrottle.waitMs() / 1000))
         },
       })
-      setRetryNotice(null)
+      setWaitProgress(null)
+      setThrottleRemaining(0)
 
       if (!result.ok) {
+        // 用户主动取消不算失败，不留失败记录、不弹错误
+        if (result.error.canceled) return
+
         // 创建阶段失败也留一条记录，方便回看当时的提示词与错误
         const base = makeEntry({
           videoId: '（未创建）',
@@ -157,8 +156,16 @@ export default function App() {
       pollerRef.current?.enqueue({ localId: entry.localId, videoId: entry.videoId })
       refreshCounts()
     } finally {
+      abortRef.current = null
+      setWaitProgress(null)
+      setThrottleRemaining(0)
       setSubmitting(false)
     }
+  }
+
+  /** 取消正在等待的创建请求：立即中止，不留失败记录。 */
+  const handleCancelWait = () => {
+    abortRef.current?.abort()
   }
 
   const handleRequery = (entry: HistoryEntry) => {
@@ -244,21 +251,8 @@ export default function App() {
         </div>
       </header>
 
-      {retryNotice && (
-        <div className="banner banner--wait" role="status">
-          <div className="banner__head">
-            <span className="banner__icon" aria-hidden="true">
-              ⏳
-            </span>
-            <div className="banner__body">
-              <strong className="banner__title">正在自动重试</strong>
-              <p className="banner__hint">{retryNotice.message}。任务尚未创建，不会产生费用。</p>
-            </div>
-            <button type="button" className="banner__close" onClick={() => setRetryNotice(null)} aria-label="关闭">
-              ×
-            </button>
-          </div>
-        </div>
+      {waitProgress && (
+        <CreateWaitBanner progress={waitProgress} onCancel={handleCancelWait} throttleRemaining={throttleRemaining} />
       )}
 
       {errors.length > 0 && (

@@ -129,7 +129,7 @@ try {
     await page.close()
   }
 
-  // ---- 3. 免费档限流：识别为限流而非参数错误 ----
+  // ---- 3. 免费档限流：识别为限流，并按 1 RPM 节奏持续重试 ----
   {
     const page = await browser.newPage()
     await page.setRequestInterception(true)
@@ -145,12 +145,33 @@ try {
     await page.goto(URL, { waitUntil: 'networkidle2' })
     await page.click('.linkbtn')
     await page.click('button.btn--primary')
-    // 429 会先进入两次自动重试，等它耗尽后应给出限流提示
-    await page.waitForSelector('.banner:not(.banner--wait)', { timeout: 400000 })
-    const t = await page.$eval('.banner:not(.banner--wait)', (el) => el.innerText)
-    check('429 rate_limit_exceeded 被识别为免费档限流', /免费额度触发限流/.test(t), t.split('\n')[0])
-    check('限流提示给出等待建议', /休息几分钟/.test(t))
-    check('限流触发两次自动重试', n === 3, `共 ${n} 次请求`)
+
+    // 首次 429 后应进入等待横幅，且明确是限流、不是参数错误
+    await page.waitForSelector('.banner--wait', { timeout: 20000 })
+    const t1 = await page.$eval('.banner--wait', (el) => el.innerText)
+    check('429 rate_limit_exceeded 被识别为免费档限流', /免费档限流/.test(t1), t1.split('\n')[1] ?? '')
+    check('限流横幅说明 1 次/分钟', /1 次\/分钟/.test(t1))
+    check('限流横幅提供取消入口', /取消等待/.test(t1))
+    check('限流首次只提交一次请求', n === 1, `共 ${n} 次`)
+
+    // 免费档视频 1 RPM：第二次提交要到 60 秒之后，而不是几十秒内连打
+    await page.waitForFunction(() => /第\s*2\s*\/\s*\d+\s*次重试/.test(document.body.innerText), {
+      timeout: 120000,
+    })
+    const t2 = await page.$eval('.banner--wait', (el) => el.innerText)
+    check('限流后按 1 RPM 节奏进入第二次重试', /第\s*2\s*\/\s*6\s*次重试/.test(t2), t2.match(/第[^\n]*次重试/)?.[0] ?? '')
+    check('第二次重试确实发生', n === 2, `共 ${n} 次`)
+
+    // 取消后应干净退出：没有错误横幅、没有创建失败记录
+    await page.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('.banner--wait button')).find((x) =>
+        x.textContent?.includes('取消等待'),
+      )
+      b?.click()
+    })
+    await page.waitForFunction(() => document.querySelector('.banner--wait') === null, { timeout: 10000 })
+    const errBanner = await page.$('.banner:not(.banner--wait)')
+    check('取消限流等待后不弹错误横幅', errBanner === null)
     await page.screenshot({ path: '.shot/11-ratelimit.png' })
     await page.close()
   }

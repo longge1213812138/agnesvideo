@@ -44,18 +44,20 @@ pnpm build        # 构建到 dist/
 pnpm lint         # oxlint
 
 # 验证（需先在另一个终端启动本地服务：node scripts/launch.mjs）
-node scripts/verify-all.mjs   # 一次跑完 6 个套件、59 项断言
+node scripts/verify-all.mjs   # 一次跑完 7 个套件
 node scripts/e2e.mjs --live   # 追加真实生成（需要 Agnes 队列可用）
 ```
 
-验证套件覆盖：基础界面与 401 处理、断网/503/任务失败/429 的故障注入、按真实响应样本解析、下载链路、并发上限、刷新恢复。
+验证套件覆盖：基础界面与 401 处理、断网/503/任务失败/429 的故障注入、队列等待可取消、按真实响应样本解析、下载链路、并发上限、刷新恢复。
 
 ### 错误处理的实测补充
 
-Agnes 实际会返回文档未记载的两类失败，均已处理（见 `docs/adr/0004-auto-retry-on-queue-full.md`）：
+Agnes 实际会返回文档未记载的两类失败（见 `docs/adr/0004-auto-retry-on-queue-full.md` 与完整的调研记录 `docs/research/2026-10-17-video-queue-full.md`）：
 
-- `503 {"code":"video_queue_full"}`：创建任务自动重试 2 次（30 秒间隔），界面显示逐秒倒计时，明示不产生费用
-- `429 rate_limit_exceeded`：免费档限流，标注为「免费额度触发限流」并建议稍后重试
+- `503 {"code":"video_queue_full"}`：服务端视频队列达容量上限。实测等待 15/30/60/120 秒乃至跨 20 分钟都不恢复，官方文档未记载此码。程序按 30/45/68/101/152/180 秒递增退避，最多 6 次尝试或 15 分钟预算，横幅显示逐秒倒计时并可随时「取消等待」，明示不产生费用。
+- `429 rate_limit_exceeded`：官方 Token Plan 文档给出免费档视频模型**实际 RPM 1**，程序据此把两次创建提交间隔强制拉到 ≥60 秒，避免自己把自己打成限流。
+
+> 文档只说"免费用户受 RPM 限制"，具体数值在 [Token Plan 页](https://wiki.agnes-ai.com/zh-Hans/docs/tokenplan)。同类型 Key 共享配额池，多开 Key 不会叠加。
 
 ## 已知限制
 

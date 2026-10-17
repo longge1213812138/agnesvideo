@@ -9,6 +9,7 @@ import {
   type CreateVideoResponse,
   type VideoTaskResponse,
 } from './types'
+import { SubmitThrottle, backoffSeconds, throttleKindOf, type ThrottleKind } from './throttle'
 
 /** 从响应体里尽量抠出一句可读的原文。Agnes 的两种形状：{detail} 与 {error:{message}}。 */
 function extractRaw(body: unknown): string | null {
@@ -74,13 +75,15 @@ function httpError(status: number, raw: string | null, code: string | null = nul
   const flash = raw ? FLASH_400[raw] : undefined
   if (flash) return { kind: 'http', status, title: flash.title, hint: flash.hint, raw, retryAfterSeconds: null }
 
-  // 实测补充：文档未记载但真实存在的两类限流/排队错误
+  // 实测补充：文档未记载但真实存在的两类限流/排队错误。
+  // 依据 docs/research/2026-10-17-video-queue-full.md：503 是服务端队列硬容量，
+  // 等待数十秒乃至两分钟都不一定恢复，所以文案不能承诺"等一分钟就能排上"。
   if (code === 'video_queue_full' || (raw ?? '').includes('video queue is full')) {
     return {
       kind: 'http',
       status,
       title: '服务端生成队列已满',
-      hint: '这是 Agnes 侧的排队拥塞，不是你的参数问题，也不产生费用。等一分钟左右再点「开始生成」通常就能排上。',
+      hint: 'Agnes 的视频生成队列已达到容量上限，与你的提示词和参数无关，也不会产生费用。队列何时腾出空位由服务端决定，实测可能持续数十分钟。程序会按分钟级间隔自动重试，你也可以随时取消，换个时间或用另一个 Key 再试。',
       raw,
       retryAfterSeconds: 60,
     }
@@ -90,9 +93,9 @@ function httpError(status: number, raw: string | null, code: string | null = nul
       kind: 'http',
       status,
       title: '免费额度触发限流',
-      hint: '当前 Key 是免费档，短时间内请求过多被限流。休息几分钟再试；或升级到 Token Plan 提高限额。已创建的任务不受影响。',
+      hint: '免费档视频模型只有 1 次/分钟的实际 RPM（官方公开值），提交过快就会命中限流。等约一分钟后重试；多开同类型 Key 不会提高额度，需要更高频率只能升级 Token Plan。已创建的任务不受影响。',
       raw,
-      retryAfterSeconds: null,
+      retryAfterSeconds: 60,
     }
   }
 
@@ -216,18 +219,70 @@ function authHeaders(): Record<string, string> {
   return key ? { Authorization: `Bearer ${key}` } : {}
 }
 
+/** 创建请求在队列拥塞时的等待进度，供界面展示逐秒倒计时。 */
+export interface CreateWaitProgress {
+  /** throttling = 遵守本地节流；retrying = 服务端排队/限流后的退避 */
+  phase: 'throttling' | 'retrying'
+  /** 第几次重试（1 起），throttling 阶段为 0 */
+  attempt: number
+  /** 本次提交的总尝试次数上限（含首次） */
+  maxAttempts: number
+  /** 本段等待的总秒数 */
+  waitSeconds: number
+  /** 本段等待还剩多少秒 */
+  remainingSeconds: number
+  reason: ThrottleKind | null
+  title: string
+}
+
+/** 创建请求的耐心上限。窗口按实测的队列恢复难度定，见调研文档。 */
+export interface CreateRetryPlan {
+  /** 总尝试次数上限（含首次），默认 6 */
+  maxAttempts?: number
+  /** 从首次提交起算的总时间预算，默认 15 分钟 */
+  totalBudgetMs?: number
+}
+
+const DEFAULT_MAX_ATTEMPTS = 6
+const DEFAULT_TOTAL_BUDGET_MS = 15 * 60 * 1000
+/** 退避的绝对上限，避免服务端给出离谱的 Retry-After 把用户晾一天。 */
+const MAX_BACKOFF_SECONDS = 300
+
+/** 创建请求共享的节流器：视频模型免费档实际只有 1 次/分钟。 */
+export const submitThrottle = new SubmitThrottle()
+
+/** 可被 AbortSignal 打断的等待；返回 false 表示被取消。 */
+async function waitAbortable(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false
+  return new Promise<boolean>((resolve) => {
+    let done = false
+    const timer = setTimeout(() => {
+      done = true
+      signal?.removeEventListener('abort', onAbort)
+      resolve(true)
+    }, ms)
+    function onAbort() {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(false)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /** POST /v1/videos。失败时返回归一化错误，不抛异常。 */
 export async function createVideo(input: {
   prompt: string
   seconds: number
   aspectRatio: AspectRatio
   seed?: number
-  /** 队列满/限流时自动重试的总次数，默认 0（调用方显式开启） */
-  autoRetry?: number
-  /** 每次即将重试前回调，用于在界面上显示倒计时 */
-  onRetry?: (info: { attempt: number; total: number; waitSeconds: number; error: AgnesError }) => void
-  /** 倒计时逐秒回调 */
-  onRetryTick?: (remainingSeconds: number) => void
+  /** 队列满/限流时的重试预算；不传则只提交一次 */
+  plan?: CreateRetryPlan
+  /** 取消等待（用户点「取消等待」或组件卸载） */
+  signal?: AbortSignal
+  /** 进入等待时与逐秒推进时回调 */
+  onWait?: (progress: CreateWaitProgress) => void
 }): Promise<ApiResult<CreateVideoResponse> | ApiFailure> {
   const body: CreateVideoRequest = {
     model: MODEL_ID,
@@ -242,11 +297,36 @@ export async function createVideo(input: {
     body.seed = input.seed
   }
 
-  const maxRetry = Math.max(0, input.autoRetry ?? 0)
+  const maxAttempts = input.plan ? Math.max(1, input.plan.maxAttempts ?? DEFAULT_MAX_ATTEMPTS) : 1
+  const totalBudgetMs = input.plan ? (input.plan.totalBudgetMs ?? DEFAULT_TOTAL_BUDGET_MS) : 0
+  const deadline = Date.now() + totalBudgetMs
   let attempt = 0
 
-  // 队列满(503) 与限流(429) 是外部拥塞，自动重试比让用户手按更合理
+  // 队列满(503) 与限流(429) 是服务端拥塞，靠"重试两次"救不回来：
+  // 按官方 1 RPM 的节奏提交，并在超出预算前持续退避重试。
   for (;;) {
+    if (input.signal?.aborted) return { ok: false, error: canceledError() }
+
+    // 1) 上一次被服务端判为排队/限流后，冷却没满就不要再打，否则只会加重限流
+    const throttleWait = submitThrottle.waitMs()
+    if (throttleWait > 0) {
+      const seconds = Math.ceil(throttleWait / 1000)
+      const ok = await countdown(
+        seconds,
+        input.onWait,
+        {
+          phase: 'throttling',
+          attempt: attempt + 1,
+          maxAttempts,
+          reason: null,
+          title: '按服务端要求的间隔等待',
+        },
+        input.signal,
+      )
+      if (!ok) return { ok: false, error: canceledError() }
+      continue
+    }
+
     let res: Response
     try {
       res = await fetch(`${BASE_URL}/videos`, {
@@ -255,6 +335,7 @@ export async function createVideo(input: {
         body: JSON.stringify(body),
       })
     } catch (e) {
+      if (input.signal?.aborted) return { ok: false, error: canceledError() }
       return { ok: false, error: networkError(e) }
     }
 
@@ -267,29 +348,50 @@ export async function createVideo(input: {
     }
 
     if (!res.ok) {
-      const err = httpError(res.status, extractRaw(parsed), extractCode(parsed))
-      const retryable = err.status === 503 || err.status === 429
-      if (retryable && attempt < maxRetry) {
-        attempt += 1
-        // 优先遵守服务端的 Retry-After；未提供时按状态码取默认间隔
-        const header = res.headers.get('retry-after')
-        const headerSeconds = header ? Number(header) : NaN
-        const waitSeconds =
-          Number.isFinite(headerSeconds) && headerSeconds > 0
-            ? Math.min(headerSeconds, 300)
-            : err.status === 429
-              ? 60
-              : 30
-        err.retryAfterSeconds = waitSeconds
-        input.onRetry?.({ attempt, total: maxRetry, waitSeconds, error: err })
-        // 分段等待，让调用方可以展示逐秒倒计时并及时感知取消
-        for (let s = waitSeconds; s > 0; s--) {
-          input.onRetryTick?.(s)
-          await new Promise((r) => setTimeout(r, 1000))
-        }
-        continue
+      const raw = extractRaw(parsed)
+      const code = extractCode(parsed)
+      const err = httpError(res.status, raw, code)
+      const kind = throttleKindOf({ status: err.status, raw, code })
+
+      if (kind) {
+        err.retryAfterSeconds = err.retryAfterSeconds ?? backoffSeconds(kind, attempt)
       }
-      return { ok: false, error: err }
+
+      const canRetry =
+        kind !== null &&
+        attempt + 1 < maxAttempts &&
+        Date.now() < deadline &&
+        !input.signal?.aborted
+
+      if (!canRetry) {
+        if (input.signal?.aborted) return { ok: false, error: canceledError() }
+        return { ok: false, error: err }
+      }
+
+      attempt += 1
+      // 优先遵守服务端的 Retry-After；没有就用按错误类别取的退避序列
+      const header = res.headers.get('retry-after')
+      const headerSeconds = header ? Number(header) : NaN
+      const waitSeconds =
+        Number.isFinite(headerSeconds) && headerSeconds > 0
+          ? Math.min(headerSeconds, MAX_BACKOFF_SECONDS)
+          : backoffSeconds(kind, attempt - 1)
+
+      // 剩余时间不够这一轮就不必再等，直接如实报错，避免把用户晾在原地
+      if (Date.now() + waitSeconds * 1000 > deadline) {
+        return { ok: false, error: err }
+      }
+
+      submitThrottle.freeze(waitSeconds)
+      const ok = await countdown(waitSeconds, input.onWait, {
+        phase: 'retrying',
+        attempt,
+        maxAttempts,
+        reason: kind,
+        title: err.title,
+      }, input.signal)
+      if (!ok) return { ok: false, error: canceledError() }
+      continue
     }
 
     const data = parsed as CreateVideoResponse | null
@@ -306,8 +408,39 @@ export async function createVideo(input: {
         },
       }
     }
+    submitThrottle.clearCooldown()
     return { ok: true, data }
   }
+}
+
+/** 用户主动取消时的统一错误，界面据此显示"已取消"而不是失败。 */
+function canceledError(): AgnesError {
+  return {
+    kind: 'network',
+    status: null,
+    title: '已取消等待',
+    hint: '你取消了这次自动重试，没有创建任务，也不产生费用。需要时再点「开始生成」即可。',
+    raw: null,
+    retryAfterSeconds: null,
+    canceled: true,
+  }
+}
+
+/** 逐秒推进倒计时，让界面能显示剩余秒数并及时响应取消。 */
+async function countdown(
+  waitSeconds: number,
+  onWait: ((progress: CreateWaitProgress) => void) | undefined,
+  base: Omit<CreateWaitProgress, 'waitSeconds' | 'remainingSeconds'>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  for (let s = waitSeconds; s > 0; s--) {
+    if (signal?.aborted) return false
+    onWait?.({ ...base, waitSeconds, remainingSeconds: s })
+    const ok = await waitAbortable(1000, signal)
+    if (!ok) return false
+  }
+  onWait?.({ ...base, waitSeconds, remainingSeconds: 0 })
+  return true
 }
 
 /**

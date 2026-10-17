@@ -103,6 +103,8 @@ export interface AgnesError {
   hint: string
   /** 服务端原文，保留不翻译 */
   raw: string | null
-  /** 429 时的退避秒数 */
+  /** 429/503 时的退避秒数 */
   retryAfterSeconds: number | null
+  /** 用户主动取消等待，不是真实失败，界面不应记为失败 */
+  canceled?: boolean
 }

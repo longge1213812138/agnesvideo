@@ -16,7 +16,7 @@ const check = (name, ok, detail = '') => {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// 场景 B 里 503 后要等满 30 秒退避，因此该场景的超时留足余量
+// 场景 B 里 503 后要等满首次退避（30 秒），因此该场景的超时留足余量
 const B_SCENARIO_TIMEOUT = 180_000
 void sleep
 
@@ -131,16 +131,17 @@ try {
     const waitText = await page.$eval('.banner--wait', (el) => el.innerText)
     check('队列满时显示自动重试横幅', /服务端生成队列已满/.test(waitText), waitText.split('\n')[0])
     check('横幅说明不产生费用', /不会产生费用/.test(waitText))
+    check('横幅提供取消入口', /取消等待/.test(waitText))
 
     // 倒计时确实在走：等 3 秒后秒数应减少
-    const n1 = Number((waitText.match(/(\d+)\s*秒后自动重试/) ?? [])[1] ?? -1)
+    const n1 = Number((waitText.match(/(\d+)\s*秒/) ?? [])[1] ?? -1)
     await new Promise((r) => setTimeout(r, 3000))
     const waitText2 = await page.$eval('.banner--wait', (el) => el.innerText)
-    const n2 = Number((waitText2.match(/(\d+)\s*秒后自动重试/) ?? [])[1] ?? -1)
+    const n2 = Number((waitText2.match(/(\d+)\s*秒/) ?? [])[1] ?? -1)
     check('重试倒计时逐秒递减', n1 > 0 && n2 > 0 && n2 < n1, `${n1}s → ${n2}s`)
     await page.screenshot({ path: '.shot/05-retrying.png' })
 
-    // 503 默认退避 30 秒；两次 503 后第三次成功，再进入轮询
+    // 503 首次退避 30 秒；两次 503 后第三次成功，再进入轮询
     await page.waitForFunction(() => /45%/.test(document.body.innerText), { timeout: B_SCENARIO_TIMEOUT })
     check('重试成功后进入轮询并显示进度', true, '45%')
     const statusText = await page.$eval('.card__status', (el) => el.textContent)
