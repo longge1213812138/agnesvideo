@@ -6,6 +6,7 @@
 import { spawn } from 'node:child_process'
 
 const SUITES = [
+  ['启动脚本编码', 'scripts/check-start-cmd.mjs'],
   ['基础界面与错误处理', 'scripts/e2e.mjs'],
   ['故障注入（断网/503/失败/429）', 'scripts/e2e-faults.mjs'],
   ['真实响应样本解析', 'scripts/e2e-samples.mjs'],
